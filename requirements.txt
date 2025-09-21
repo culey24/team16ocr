@@ -2,3 +2,5 @@ torch
 torchvision
 transformers
 rapidfuzz
+opencv-python
+paddleocr
