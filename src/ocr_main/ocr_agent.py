@@ -7,8 +7,10 @@ OCR Agent for Korean (TrOCR)
   2) Inference ảnh đã crop (text-line) hoặc ảnh lớn (A4/banner) qua detector(DB)->crop->recognizer.
 - Detector: PaddleOCR (tuỳ chọn). Nếu không cài, bạn vẫn dùng được predict trên ảnh đã crop.
 
-Author: you + gpt :)
+Tự động fallback:
+- Nếu model_dir_or_ckpt không hợp lệ / không tải được -> fallback sang fallback_ckpt (mặc định trocr-base-printed).
 """
+
 import numpy as np
 import os, re, glob, unicodedata
 from dataclasses import dataclass
@@ -125,17 +127,60 @@ class TrainConfig:
     num_beams: int    = 4
 
 # =========================
+# Helpers: resolve checkpoint with fallback
+# =========================
+def _is_local_model_dir(path: str) -> bool:
+    """Heuristic: có file config/tokenizer là coi như thư mục model hợp lệ."""
+    if not os.path.isdir(path):
+        return False
+    needed = ["config.json", "preprocessor_config.json"]
+    return any(os.path.isfile(os.path.join(path, f)) for f in needed)
+
+def _load_processor_and_model(model_dir_or_ckpt: str, device: str, fallback_ckpt: str):
+    """
+    Cố gắng load theo model_dir_or_ckpt; nếu lỗi -> fallback_ckpt.
+    Trả về (processor, model, used_source)
+    """
+    tried = []
+    for source in [model_dir_or_ckpt, fallback_ckpt]:
+        try:
+            processor = TrOCRProcessor.from_pretrained(source)
+            model = VisionEncoderDecoderModel.from_pretrained(source)
+            model.to(device).eval()
+            return processor, model, source
+        except Exception as e:
+            tried.append((source, repr(e)))
+            continue
+    # Nếu cả hai đều fail -> raise với log rõ ràng
+    msg = "Cannot load model. Tried:\n" + "\n".join(f"- {s}: {err}" for s, err in tried)
+    raise RuntimeError(msg)
+
+# =========================
 # OCR Agent (Recognizer + optional Detector)
 # =========================
 class KoreanOcrAgent:
     """
     Recognizer (TrOCR) + optional big-image pipeline via PaddleOCR detector.
+    - Nếu model_dir_or_ckpt không tồn tại hoặc tải thất bại: tự fallback sang fallback_ckpt (mặc định trocr-base-printed).
     """
-    def __init__(self, model_dir_or_ckpt: str, device: Optional[str] = None):
+    def __init__(self,
+                 model_dir_or_ckpt: Optional[str] = None,
+                 device: Optional[str] = None,
+                 fallback_ckpt: str = "microsoft/trocr-base-printed"):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.processor = TrOCRProcessor.from_pretrained(model_dir_or_ckpt)
-        self.model     = VisionEncoderDecoderModel.from_pretrained(model_dir_or_ckpt)
-        self.model.to(self.device).eval()
+
+        # Nếu không truyền gì -> dùng thẳng fallback_ckpt
+        candidate = model_dir_or_ckpt or fallback_ckpt
+
+        # Nếu truyền đường dẫn local nhưng không hợp lệ -> bỏ qua, sẽ rơi xuống fallback trong _load...
+        if _is_local_model_dir(candidate):
+            primary = candidate
+        else:
+            primary = candidate  # có thể là HF id, để _load_... tự xử lý
+
+        self.processor, self.model, used = _load_processor_and_model(primary, self.device, fallback_ckpt)
+        self.used_source = used  # để bạn biết đang dùng model nào
+
         # Detector lazy-loading
         self._detector = None
         self._cv2 = None
@@ -196,14 +241,14 @@ class KoreanOcrAgent:
         if self._detector is None:
             raise RuntimeError("Detector not enabled. Call enable_detector(lang='korean') before ocr_big_image().")
 
-        cv2, np = self._cv2, self._np
+        cv2, np_ = self._cv2, self._np
 
         # 1) detect
         det_res = self._detector.ocr(image_path, det=True, rec=False)
         boxes = []
         if det_res and det_res[0]:
             for item in det_res[0]:
-                pts = np.array(item[0], dtype=np.float32)  # (4,2)
+                pts = np_.array(item[0], dtype=np_.float32)  # (4,2)
                 xs, ys = pts[:, 0], pts[:, 1]
                 if (xs.max() - xs.min()) >= min_box and (ys.max() - ys.min()) >= min_box:
                     boxes.append(pts)
@@ -218,7 +263,7 @@ class KoreanOcrAgent:
         img_bgr = cv2.imread(image_path)
         results = []
         for quad in boxes:
-            crop_bgr = _quad_to_perspective(cv2, quad, img_bgr)
+            crop_bgr = _quad_to_perspective(cv2, np_, quad, img_bgr)
             pil = _bgr_to_pil(cv2, crop_bgr)
             enc = self.processor(images=[pil], return_tensors="pt").pixel_values.to(self.device)
             gen = self.model.generate(enc, num_beams=beams, max_length=max_length)
@@ -230,33 +275,25 @@ class KoreanOcrAgent:
 # =========================
 # Perspective helpers
 # =========================
-def _order_quad(cv2, pts):
-    rect = pts.copy().astype("float32")
+def _order_quad(cv2, np_, pts):
     s = pts.sum(axis=1)
-    diff = cv2.subtract(pts[:, 0], pts[:, 1])  # x - y
-    rect_out = cv2.convexHull(pts).reshape(-1, 2).astype("float32")  # not strictly needed
-    # more robust ordering:
-    tl = pts[np.argmin(s)]
-    br = pts[np.argmax(s)]
-    tr = pts[np.argmin(diff)]
-    bl = pts[np.argmax(diff)]
-    return cv2.convertPointsToHomogeneous(
-        cv2.UMat(np.array([tl, tr, br, bl], dtype=np.float32))
-    ).get().reshape(-1, 3)[:, :2].astype(np.float32)
+    diff = pts[:, 0] - pts[:, 1]
+    tl = pts[np_.argmin(s)]
+    br = pts[np_.argmax(s)]
+    tr = pts[np_.argmin(diff)]
+    bl = pts[np_.argmax(diff)]
+    return np_.array([tl, tr, br, bl], dtype=np_.float32)
 
-def _quad_to_perspective(cv2, quad, img_bgr, pad: int = 2):
-    rect = _order_quad(cv2, quad)
+def _quad_to_perspective(cv2, np_, quad, img_bgr, pad: int = 2):
+    rect = _order_quad(cv2, np_, quad)
 
-    w1 = _l2(rect[1], rect[0])
-    w2 = _l2(rect[2], rect[3])
-    h1 = _l2(rect[3], rect[0])
-    h2 = _l2(rect[2], rect[1])
-    width = int(max(w1, w2))
-    height = int(max(h1, h2))
-    width = max(width, 1)
-    height = max(height, 1)
+    def _l2(a, b): return float(np_.linalg.norm(a - b))
+    w1 = _l2(rect[1], rect[0]); w2 = _l2(rect[2], rect[3])
+    h1 = _l2(rect[3], rect[0]); h2 = _l2(rect[2], rect[1])
+    width  = max(int(max(w1, w2)), 1)
+    height = max(int(max(h1, h2)), 1)
 
-    dst = _np_array([[0, 0], [width-1, 0], [width-1, height-1], [0, height-1]], dtype="float32", cv2=cv2)
+    dst = np_.array([[0, 0], [width-1, 0], [width-1, height-1], [0, height-1]], dtype=np_.float32)
     M = cv2.getPerspectiveTransform(rect, dst)
     warped = cv2.warpPerspective(img_bgr, M, (width, height), flags=cv2.INTER_CUBIC)
 
@@ -267,14 +304,6 @@ def _quad_to_perspective(cv2, quad, img_bgr, pad: int = 2):
 def _bgr_to_pil(cv2, bgr):
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     return Image.fromarray(rgb)
-
-def _np_array(data, dtype, cv2):
-    import numpy as _np
-    return _np.array(data, dtype=getattr(_np, dtype) if isinstance(dtype, str) else dtype)
-
-def _l2(a, b):
-    import numpy as _np
-    return float(_np.linalg.norm(a - b))
 
 # =========================
 # Public train entry
