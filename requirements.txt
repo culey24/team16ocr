@@ -4,3 +4,4 @@ transformers
 rapidfuzz
 opencv-python
 paddleocr
+easyocr
